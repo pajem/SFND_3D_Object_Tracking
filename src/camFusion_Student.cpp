@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <unordered_map>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
@@ -125,7 +126,7 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
 
     // display image
     string windowName = "3D Objects";
-    cv::namedWindow(windowName, 1);
+    cv::namedWindow(windowName, cv::WINDOW_NORMAL);
     cv::imshow(windowName, topviewImg);
 
     if(bWait)
@@ -134,11 +135,50 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
     }
 }
 
+namespace {
+
+// helper function to filter the matches in the current frame that are inside a given roi
+std::vector<cv::DMatch> getMatchesInsideRoi(const std::vector<cv::KeyPoint>& keypoints, const std::vector<cv::DMatch> &matches, const cv::Rect& roi) {
+    std::vector<cv::DMatch> matchesInsideRoi;
+    for (auto& match : matches) {
+        auto& keypoint = keypoints[match.trainIdx];
+        if (roi.contains(keypoint.pt)) {
+            matchesInsideRoi.push_back(match);
+        }
+    }
+    return matchesInsideRoi;
+}
+
+} // namespace
 
 // associate a given bounding box with the keypoints it contains
 void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, std::vector<cv::DMatch> &kptMatches)
 {
-    // ...
+    // get all matches inside bounding box, bounding box is size is shrunk to remove some keypoints that don't belong to the target object
+    cv::Rect smallerBox = boundingBox.roi;
+    smallerBox.width = boundingBox.roi.width * 0.9;
+    smallerBox.height = boundingBox.roi.height * 0.9;
+    const std::vector<cv::DMatch> matchesInsideBox = ::getMatchesInsideRoi(kptsCurr, kptMatches, smallerBox);
+
+    // compute the average euclidean distance of all matches
+    std::vector<double> euclideanDistances;
+    for (auto& match : matchesInsideBox) {
+        auto& currKeypoint = kptsCurr[match.trainIdx];
+        auto& prevKeypoint = kptsPrev[match.queryIdx];
+        euclideanDistances.push_back(cv::norm(currKeypoint.pt - prevKeypoint.pt));
+    }
+    const double totalEuclideanDistance = std::accumulate(euclideanDistances.begin(), euclideanDistances.end(), 0.0);
+    const double averageEuclideanDistance = totalEuclideanDistance / euclideanDistances.size();
+
+    // filter out matches that are far from the mean (outliers)
+    const double thresholdDistance = averageEuclideanDistance * 1.5;
+    for (size_t i = 0; i < euclideanDistances.size(); ++i) {
+        if (euclideanDistances[i] < thresholdDistance) {
+            auto& match = matchesInsideBox[i];
+            boundingBox.kptMatches.push_back(match);
+            boundingBox.keypoints.push_back(kptsCurr[match.trainIdx]);
+        }
+    }
 }
 
 
@@ -146,18 +186,141 @@ void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint
 void computeTTCCamera(std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, 
                       std::vector<cv::DMatch> kptMatches, double frameRate, double &TTC, cv::Mat *visImg)
 {
-    // ...
+    // computes distance of keypoints to each other keypoint
+    // then for each distance, compute the ratio between current and previos frame value
+    std::vector<double> distanceRatios;
+    for (size_t i = 0; i < kptMatches.size(); ++i) {
+        auto& currKeypoint = kptsCurr[kptMatches[i].trainIdx];
+        auto& prevKeypoint = kptsPrev[kptMatches[i].queryIdx];
+        for (size_t j = 0; j < kptMatches.size(); ++j) {
+            // skip if same keypoint
+            if (i == j) {
+                continue;
+            }
+
+            // compute distance between keypoints
+            auto& currKeypointOther = kptsCurr[kptMatches[j].trainIdx];
+            auto& prevKeypointOther = kptsPrev[kptMatches[j].queryIdx];
+            double currDistance = cv::norm(currKeypoint.pt - currKeypointOther.pt);
+            double prevDistance = cv::norm(prevKeypoint.pt - prevKeypointOther.pt);
+
+            // compute ratio between current and previous frame distance
+            static const double minDistance = 50;
+            if (prevDistance > 0.0 && currDistance >= minDistance) {
+                distanceRatios.push_back(currDistance / prevDistance);
+            }
+        }
+    }
+    if (distanceRatios.empty())
+    {
+        TTC = NAN;
+        return;
+    }
+
+    // compute TTC using median distance ratio
+    std::sort(distanceRatios.begin(), distanceRatios.end());
+    double medianDistRatio;
+    size_t size = distanceRatios.size();
+    if (size % 2 == 0) {
+      medianDistRatio = (distanceRatios[size / 2 - 1] + distanceRatios[size / 2]) / 2.0;
+    } else {
+      medianDistRatio = distanceRatios[size / 2];
+    }
+    double deltaT = 1 / frameRate;
+    TTC = -deltaT / (1 - medianDistRatio);
 }
 
+namespace {
+
+// Get the median value of the N% nearest points.
+double medianOfNearestXs(const std::vector<LidarPoint>& points, double samplePercentage) {
+    // sort by nearest X
+    auto compareNearerX = [](const LidarPoint& p1, const LidarPoint& p2) {
+        return p1.x < p2.x;
+    };
+    std::vector<LidarPoint> sortedPoints = points;
+    std::sort(sortedPoints.begin(), sortedPoints.end(), compareNearerX);
+
+    // resize to remove elements at the end of the vector
+    size_t sampleSize = sortedPoints.size() * samplePercentage;
+    sortedPoints.resize(sampleSize);
+
+    // get the median value
+    return sortedPoints[sampleSize / 2].x;
+}
+
+} // namespace
 
 void computeTTCLidar(std::vector<LidarPoint> &lidarPointsPrev,
                      std::vector<LidarPoint> &lidarPointsCurr, double frameRate, double &TTC)
 {
-    // ...
-}
+    bool filterOutliers = true;
+    double prevNearestX;
+    double currNearestX;
 
+    if (filterOutliers) {
+        // Filter outlier points by getting the N% nearest points and using the median value as the nearest point.
+        // This does not give the nearest point exactly but it assumes that the cluster of N% nearest points are close enough together,
+        // such that any point in that cluster (for this case the median value) can represent the nearest point.
+        const double samplePercentage = 0.05;
+        prevNearestX = medianOfNearestXs(lidarPointsPrev, samplePercentage);
+        currNearestX = medianOfNearestXs(lidarPointsCurr, samplePercentage);
+    } else {
+        auto compareNearerX = [](const LidarPoint& p1, const LidarPoint& p2) {
+            return p1.x < p2.x;
+        };
+        prevNearestX = std::min_element(lidarPointsPrev.begin(), lidarPointsPrev.end(), compareNearerX)->x;
+        currNearestX = std::min_element(lidarPointsCurr.begin(), lidarPointsCurr.end(), compareNearerX)->x;
+    }
+
+    // compute TTC using constant velocity model
+    const double deltaX = prevNearestX - currNearestX;
+    const double deltaT = 1.0 / frameRate;
+    const double velocity = deltaX / deltaT;
+    TTC = currNearestX / velocity;
+
+    std::cout << "delta T " << deltaT << "s" <<std::endl;
+    std::cout << "nearest point prev X " << prevNearestX << std::endl;
+    std::cout << "nearest point curr X " << currNearestX << std::endl;
+}
 
 void matchBoundingBoxes(std::vector<cv::DMatch> &matches, std::map<int, int> &bbBestMatches, DataFrame &prevFrame, DataFrame &currFrame)
 {
-    // ...
+    // for each current frame bounding box...
+    for (const auto& currBoundingBox : currFrame.boundingBoxes) {
+        std::cout << "Finding best match for current frame bounding box " << currBoundingBox.boxID << std::endl;
+        // get matches that are inside the current bounding box
+        const std::vector<cv::DMatch> matchesInsideCurrBox = ::getMatchesInsideRoi(currFrame.keypoints, currFrame.kptMatches, currBoundingBox.roi);
+
+        // then try to find the best matching bounding box from the previous frame w/ the most number of matching keypoints inside prev box
+        std::unordered_map<int, int> prevBoxIdAndNumberOfMatchesMap;
+        for (const auto& prevBoundingBox : prevFrame.boundingBoxes) {
+            // count the number of matching keypoints inside prev frame bounding box roi
+            int prevKeypointsInsideRoiCounter = 0;
+            for (auto& matchInsideCurrBox : matchesInsideCurrBox) {
+                int prevKeypointIndex = matchInsideCurrBox.queryIdx;
+                auto& prevKeypoint = prevFrame.keypoints[prevKeypointIndex];
+                if (prevBoundingBox.roi.contains(prevKeypoint.pt)) {
+                    ++prevKeypointsInsideRoiCounter;
+                }
+            }
+            if (prevKeypointsInsideRoiCounter > 0) {
+                // prev frame bounding box is candidate as best match
+                prevBoxIdAndNumberOfMatchesMap[prevBoundingBox.boxID] = prevKeypointsInsideRoiCounter;
+                std::cout << "Candidate found. Previous frame bounding box " << prevBoundingBox.boxID;
+                std::cout << " w/ corresponding matches count " << prevKeypointsInsideRoiCounter << std::endl;
+            }
+        }
+        if (!prevBoxIdAndNumberOfMatchesMap.empty()) {
+          int bestPrevBoxIndex = std::max_element(prevBoxIdAndNumberOfMatchesMap.begin(),
+                                                  prevBoxIdAndNumberOfMatchesMap.end(),
+                                                  [](const std::pair<int, int>& p1, const std::pair<int, int>& p2) {
+                                                      return p1.second < p2.second;}
+                                                  )->first;
+          bbBestMatches[currBoundingBox.boxID] = bestPrevBoxIndex;
+          std::cout << "BEST MATCH is previous frame bounding box "
+                    << bestPrevBoxIndex << std::endl;
+        }
+        std::cout << "----" << std::endl;
+    }
 }
